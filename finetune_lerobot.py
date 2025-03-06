@@ -27,7 +27,12 @@ from octo.utils.train_utils import (
     TrainState,
 )
 
+import torch
+import lerobot
 
+from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+from huggingface_hub import HfApi
+from pprint import pprint
 
 FLAGS = flags.FLAGS
 
@@ -55,7 +60,8 @@ def main(_):
     tf.config.set_visible_devices([], "GPU")
 
     # setup wandb for logging
-    wandb.init(name="finetune_aloha", project="octo")
+    # wandb.init(name="finetune_aloha", project="octo")
+
 
     # load pre-trained model
     logging.info("Loading pre-trained model...")
