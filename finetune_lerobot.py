@@ -33,6 +33,10 @@ import lerobot
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from huggingface_hub import HfApi
 from pprint import pprint
+import torch.nn.functional as F
+from torchvision.transforms import Resize
+
+from einops import rearrange
 
 FLAGS = flags.FLAGS
 
@@ -41,7 +45,7 @@ flags.DEFINE_string(
 )
 flags.DEFINE_string("data_dir", None, "Path to finetuning dataset, in RLDS format.")
 flags.DEFINE_string("save_dir", None, "Directory for saving finetuning checkpoints.")
-flags.DEFINE_integer("batch_size", 1, "Batch size for finetuning.")
+flags.DEFINE_integer("batch_size", 32, "Batch size for finetuning.")
 
 flags.DEFINE_bool(
     "freeze_transformer",
@@ -61,6 +65,88 @@ def main(_):
 
     # setup wandb for logging
     # wandb.init(name="finetune_aloha", project="octo")
+
+    repo_id = "lerobot/aloha_sim_transfer_cube_human_image"
+    dataset_root = "/mnt/hdd/john/lerobot_dataset/aloha_sim_transfer_cube_human_image"
+
+    ds_meta = LeRobotDatasetMetadata(repo_id, root=dataset_root)
+
+    # print(f"Total number of episodes: {ds_meta.total_episodes}")
+    # print(f"Average number of frames per episode: {ds_meta.total_frames / ds_meta.total_episodes:.3f}")
+    # print(f"Frames per second used during data collection: {ds_meta.fps}")
+    # print(f"Robot type: {ds_meta.robot_type}")
+    # print(f"keys to access images from cameras: {ds_meta.camera_keys=}\n")
+
+    # Resize image to 256 x 256 for faster inference
+    image_transforms = Resize((256, 256))
+
+    # Take 50 as action chunk size (1s in 50Hz ALOHA Sim setup)
+    delta_timestamps = {
+        "observation.images.top": [0],
+        "observation.state": [0],
+        "action" : [t / 50 for t in range(50)]
+    }
+
+    le_dataset = LeRobotDataset(repo_id, root=dataset_root, delta_timestamps=delta_timestamps, image_transforms=image_transforms)
+    print(f"Number of episodes selected: {le_dataset.num_episodes}")
+    print(f"Number of frames selected: {le_dataset.num_frames}")
+
+    # episode_index = 1
+    # from_idx = le_dataset.episode_data_index["from"][episode_index].item()
+    # to_idx = le_dataset.episode_data_index["to"][episode_index].item()
+    # print(from_idx, to_idx)
+
+    # print(f"{le_dataset[0]['action'].shape=}")
+    
+    camera_key = le_dataset.meta.camera_keys[0]
+    # print(f"\n{le_dataset[0][camera_key].shape=}")
+
+    # print(le_dataset[0])
+
+    def collate_lerobot(orig_batch):
+        new_batch = {}
+
+        # LeRobot Batch (Orig Batch)
+        # action : [32, 50, 14] torch tensor (batch #, action horizon, proprio control joint #)
+        # action_is_pad : [32, 50] (batch #, action horizon)
+
+        # RLDS Batch (New Batch)
+        # action : (32, 1, 50, 14) numpy array -> second dim?? don't know waht
+        # action_pad_mask : (32, 1, 50, 14) numpy array
+
+        new_batch["action"] = orig_batch["action"].unsqueeze(1).numpy()
+        new_batch["action_pad_mask"] = orig_batch["action_is_pad"].unsqueeze(1).unsqueeze(-1).repeat(1,1,1,14).numpy()
+
+        # Orig Batch
+        # observation.images.top : (32, 1, 3, 256, 256) tensor
+        # observation.state : (32, 1, 14) tensor
+        # timestamp : (32) tensor
+        # next.done : (32) tensor
+        # task : list
+
+        # New Batch
+        # observation.image_primary : (32, 1, 256, 256, 3) numpy array
+        # observation.proprio : (32, 1, 14) numpy array
+        # observation.timestep : (32, 1) numpy array
+        # observation.pad_mask_dict : numpy array
+        # observation.timestep_pad_mask : (32, 1) numpy array
+        # task_complete : (32, 1, 50) numpy array
+
+        new_batch["observation"] = {}
+        new_batch["observation"]["image_primary"] = rearrange(orig_batch["observation.images.top"], "b n c h w -> b n h w c").numpy()
+        new_batch["observation"]["proprio"] = orig_batch["observation.state"].numpy()
+
+
+
+        new_batch["task"] = {}
+
+        return new_batch
+
+    le_dataloader = iter(torch.utils.data.DataLoader(
+        le_dataset,
+        batch_size=FLAGS.batch_size,
+        drop_last=True
+    ))
 
 
     # load pre-trained model
@@ -89,10 +175,17 @@ def main(_):
         ),
         train=True,
     )
+    # train_data_iter = (
+    #     dataset.repeat()
+    #     .unbatch()
+    #     .shuffle(10000)  # can reduce this if RAM consumption too high
+    #     .batch(FLAGS.batch_size)
+    #     .iterator()
+    # )
+
     train_data_iter = (
         dataset.repeat()
         .unbatch()
-        .shuffle(10000)  # can reduce this if RAM consumption too high
         .batch(FLAGS.batch_size)
         .iterator()
     )
@@ -107,6 +200,42 @@ def main(_):
 
     train_data_iter = map(process_batch, train_data_iter)
     example_batch = next(train_data_iter)
+
+    ex_le_batch = next(le_dataloader)
+
+    # image_primary : array
+    # proprio : array
+    # timestep
+
+    # print(example_batch["action"].shape)
+    # print(example_batch["action_pad_mask"].shape)
+
+    # print(ex_le_batch["action"].shape)
+    # print(ex_le_batch["action_is_pad"].shape)
+
+    # print(example_batch["observation"]["image_primary"].shape)
+    # print(example_batch["observation"]["proprio"].shape)
+    print(example_batch["observation"]["timestep"])
+    # print(example_batch["observation"]["pad_mask_dict"])
+    print(example_batch["observation"]["timestep_pad_mask"])
+    print(example_batch["observation"]["task_completed"].shape, "\n")
+
+    # print(ex_le_batch["observation.images.top"].shape)
+    # print(ex_le_batch["observation.state"].shape)
+    print(ex_le_batch["next.done"].shape)
+    print(ex_le_batch["timestamp"])
+
+
+    # for key in ex_le_batch.keys():
+    #     print(key, type(ex_le_batch[key]))
+
+    # for key in example_batch["observation"]:
+    #     print(key, type(example_batch["observation"][key]))
+
+    # for key in example_batch["task"]:
+    #     print(key, type(example_batch["task"][key]))
+
+    exit(0)
 
     # load pre-training config and modify --> remove wrist cam, add proprio input, change action head
     # following Zhao et al. we use "action chunks" of length 50 and L1 loss for ALOHA
