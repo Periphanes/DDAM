@@ -880,6 +880,13 @@ class DiscreteDiffusionActionHead(nn.Module):
     diffusion_steps: int = 20
     n_diffusion_samples: int = 1
 
+    vocab_size = 2048 # Vocab Size of Default Universal Action Tokenizer FAST - Physical Intelligence
+    mask_index = vocab_size
+    vocab_size += 1
+    pad_index = vocab_size
+    vocab_size += 1
+    # Pad Index = 2049
+
     def setup(self):
         if self.use_map:
             self.map_head = MAPHead()
