@@ -37,6 +37,12 @@ import torch.nn.functional as F
 from torchvision.transforms import Resize
 
 from einops import rearrange
+import numpy as np
+from transformers import AutoProcessor
+from torch.utils.data._utils.collate import default_collate
+
+MASK_TOKEN = 2048
+PAD_TOKEN = 2049
 
 FLAGS = flags.FLAGS
 
@@ -53,6 +59,8 @@ flags.DEFINE_bool(
     "Whether pre-trained transformer weights should be frozen.",
 )
 
+flags.DEFINE_integer("action_horizon", 75, "action horizon sampled before tokenization")
+flags.DEFINE_integer("token_horizon", 30, "number of tokens used as action chunk horizon")
 
 def main(_):
     assert (
@@ -84,7 +92,7 @@ def main(_):
     delta_timestamps = {
         "observation.images.top": [0],
         "observation.state": [0],
-        "action" : [t / 50 for t in range(50)]
+        "action" : [t / 50 for t in range(FLAGS.action_horizon)]
     }
 
     le_dataset = LeRobotDataset(repo_id, root=dataset_root, delta_timestamps=delta_timestamps, image_transforms=image_transforms)
@@ -103,19 +111,50 @@ def main(_):
 
     # print(le_dataset[0])
 
+    tokenizer = AutoProcessor.from_pretrained("physical-intelligence/fast", trust_remote_code=True)
+    # tokens = tokenizer(ex_le_batch["action"].numpy())
+
     def collate_lerobot(orig_batch):
         new_batch = {}
 
+        orig_batch = default_collate(orig_batch)
+
         # LeRobot Batch (Orig Batch)
-        # action : [32, 50, 14] torch tensor (batch #, action horizon, proprio control joint #)
-        # action_is_pad : [32, 50] (batch #, action horizon)
+        # action : [32, 50, 14] torch tensor (batch #, action_horizon, proprio control joint #)
+        # action_is_pad : [32, 50] torch boolean (batch #, action_horizon)
+            # -> True if padding
 
         # RLDS Batch (New Batch)
-        # action : (32, 1, 50, 14) numpy array -> second dim?? don't know waht
+        # action : (32, 1, 50, 14) numpy array -> second dim = window size
         # action_pad_mask : (32, 1, 50, 14) numpy array
+            # -> True if NOT padding, need to invert from LeRobot Padding
 
-        new_batch["action"] = orig_batch["action"].unsqueeze(1).numpy()
-        new_batch["action_pad_mask"] = orig_batch["action_is_pad"].unsqueeze(1).unsqueeze(-1).repeat(1,1,1,14).numpy()
+        action_org = orig_batch["action"]
+        action_pad_org = orig_batch["action_is_pad"]
+
+        tokenized_action_batch = []
+        tokenized_action_pad_batch = []
+        for batch_num_i in range(FLAGS.batch_size):
+            valid_actions = action_org[batch_num_i][~action_pad_org[batch_num_i]]
+            tokens = tokenizer(valid_actions)[0]
+            if len(tokens) < FLAGS.token_horizon:
+                tokens = tokens + [PAD_TOKEN] * (FLAGS.token_horizon - len(tokens))
+                pad = [True] * (len(tokens)) + [False] * (FLAGS.token_horizon - len(tokens))
+            else:
+                tokens = tokens[:FLAGS.token_horizon]
+                pad = [True] * len(tokens)
+            print(tokens)
+
+            tokenized_action_batch.append(tokens)
+            tokenized_action_pad_batch.append(pad)
+        tokenized_action_batch = np.array(tokenized_action_batch) # (32,30) -> (batch_size, token_horizon)
+        tokenized_action_pad_batch = np.array(tokenized_action_pad_batch) # (32, 30) -> (batch_size, token_horizon)
+
+        # print(tokenized_action_pad_batch.shape)
+        # print(tokenized_action_batch.shape)
+
+        new_batch["action"] = tokenized_action_batch
+        new_batch["action_pad_mask"] = tokenized_action_pad_batch
 
         # Orig Batch
         # observation.images.top : (32, 1, 3, 256, 256) tensor
@@ -145,7 +184,8 @@ def main(_):
     le_dataloader = iter(torch.utils.data.DataLoader(
         le_dataset,
         batch_size=FLAGS.batch_size,
-        drop_last=True
+        drop_last=True,
+        collate_fn=collate_lerobot
     ))
 
 
@@ -210,8 +250,17 @@ def main(_):
     # print(example_batch["action"].shape)
     # print(example_batch["action_pad_mask"].shape)
 
-    # print(ex_le_batch["action"].shape)
-    # print(ex_le_batch["action_is_pad"].shape)
+    print(ex_le_batch["action"].shape)
+    print(ex_le_batch["action_is_pad"])
+    exit(0)
+    
+    
+    print(tokenizer.vocab_size)
+
+    print(tokens)
+
+    for rt in tokens:
+        print(len(rt))
 
     # print(example_batch["observation"]["image_primary"].shape)
     # print(example_batch["observation"]["proprio"].shape)
