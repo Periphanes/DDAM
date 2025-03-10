@@ -850,3 +850,230 @@ class UNetDDPMActionHead(nn.Module):
         )
 
         return noisy_action
+
+
+class DiscreteDiffusionActionHead(nn.Module):
+    """Predicts actions uses a diffusion process.
+
+    Only a single pass through the transformer is done to obtain an action embedding at each timestep. The
+    actions are then predicted using a diffusion process conditioned on this embedding. The diffusion model
+    architecture is an MLP with residual connections (see `octo.model.components.diffusion`).
+
+    You may create an embedding by either mean-pooling across tokens (use_map=False) or using multi-head
+    attention pooling (use_map=True). It is recommended to use MAP when decoding from the observation token
+    stream.
+    """
+
+    readout_key: str
+    use_map: bool = False
+    action_horizon: int = 1
+    action_dim: int = 7
+    max_action: float = 5.0
+    loss_type: str = "mse"
+
+    # diffusion-specific config with sane defaults
+    time_dim: int = 32
+    num_blocks: int = 3
+    dropout_rate: float = 0.0
+    hidden_dim: int = 256
+    use_layer_norm: bool = True
+    diffusion_steps: int = 20
+    n_diffusion_samples: int = 1
+
+    def setup(self):
+        if self.use_map:
+            self.map_head = MAPHead()
+
+        # create the diffusion model (score network)
+        self.diffusion_model = create_diffusion_model(
+            self.action_dim * self.action_horizon,
+            time_dim=self.time_dim,
+            num_blocks=self.num_blocks,
+            dropout_rate=self.dropout_rate,
+            hidden_dim=self.hidden_dim,
+            use_layer_norm=self.use_layer_norm,
+        )
+
+        # create beta schedule
+        self.betas = jnp.array(cosine_beta_schedule(self.diffusion_steps))
+        self.alphas = 1 - self.betas
+        self.alpha_hats = jnp.cumprod(self.alphas)
+
+    def __call__(
+        self,
+        transformer_outputs: Dict[str, TokenGroup],
+        time: Optional[ArrayLike] = None,
+        noisy_actions: Optional[ArrayLike] = None,
+        train: bool = True,
+    ) -> jax.Array:
+        """Performs a single forward pass through the diffusion model."""
+        token_group = transformer_outputs[self.readout_key]
+        assert token_group.tokens.ndim == 4, (
+            f"Expected token_group.tokens to have shape (batch_size, window_size, num_tokens, embedding_size), "
+            f"but got shape {token_group.tokens.shape}"
+        )
+        if self.use_map:  # Multi-head attention pooling
+            embeddings = self.map_head(token_group, train=train)[:, :, 0]
+        else:  # mean pooling
+            embeddings = token_group.tokens.mean(axis=-2)
+        # Now, embeddings is (batch_size, window_size, embedding_size)
+
+        # time and noisy_actions are None during initialization, so we replace them with a dummy array
+        if (time is None or noisy_actions is None) and not self.is_initializing():
+            raise ValueError(
+                "Must provide time and noisy_actions when calling diffusion action head"
+            )
+        elif self.is_initializing():
+            time = jnp.zeros((*embeddings.shape[:2], 1), dtype=jnp.float32)
+            noisy_actions = jnp.zeros(
+                (*embeddings.shape[:2], self.action_dim * self.action_horizon),
+                dtype=jnp.float32,
+            )
+        pred_eps = self.diffusion_model(embeddings, noisy_actions, time, train=train)
+        return pred_eps
+
+    def loss(
+        self,
+        transformer_outputs: Dict[str, TokenGroup],
+        actions: ArrayLike,
+        timestep_pad_mask: ArrayLike,
+        action_pad_mask: ArrayLike,
+        train: bool = True,
+    ) -> Tuple[Array, Dict[str, Array]]:
+        """Computes the loss for the diffusion objective.
+
+        Args:
+            transformer_ouputs: must contain self.readout_key with shape (batch_size, window_size, num_tokens,
+                embedding_size)
+            actions: shape (batch_size, window_size, action_horizon, action_dim)
+            timestep_pad_mask: boolean array (batch, window_size) which is True if the timestep is not a padding timestep
+            action_pad_mask: boolean array (same shape as actions) which is True if the action dimension is not a padding dimension
+
+        Returns:
+            loss: float
+            metrics: dict
+        """
+        batch_size, window_size = timestep_pad_mask.shape
+
+        # fold action_dim and action_horizon into one dimension
+        actions_flat = rearrange(actions, "b w h a -> b w (h a)")
+        actions_flat = jnp.clip(actions_flat, -self.max_action, self.max_action)
+
+        # piggy-back on the dropout rng chain for diffusion rng
+        rng = self.make_rng("dropout")
+        time_key, noise_key = jax.random.split(rng)
+        time = jax.random.randint(
+            time_key,
+            (self.n_diffusion_samples, batch_size, window_size, 1),
+            0,
+            self.diffusion_steps,
+        )
+        noise = jax.random.normal(
+            noise_key, (self.n_diffusion_samples,) + actions_flat.shape
+        )
+
+        scale = jnp.sqrt(self.alpha_hats[time])
+        std = jnp.sqrt(1 - self.alpha_hats[time])
+        noisy_actions = scale * actions_flat[None] + std * noise
+
+        pred_eps = self(
+            transformer_outputs, train=train, time=time, noisy_actions=noisy_actions
+        )
+
+        # combine the timestep pad mask with the action pad mask
+        mask = timestep_pad_mask[:, :, None, None] & action_pad_mask
+        # flatten the mask to match the flat actions
+        mask = rearrange(mask, "b w h a -> b w (h a)")
+        # add a dimension to the mask for n_diffusion_samples
+        mask = mask[None]
+
+        loss, metrics = continuous_loss(pred_eps, noise, mask, loss_type=self.loss_type)
+        # Sum over action dimension instead of averaging
+        loss = loss * self.action_dim
+        metrics["loss"] = metrics["loss"] * self.action_dim
+        metrics["mse"] = metrics["mse"] * self.action_dim
+        return loss, metrics
+
+    def predict_action(
+        self,
+        transformer_outputs: Dict[str, TokenGroup],
+        rng: PRNGKey,
+        train: bool = True,
+        embodiment_action_dim: Optional[int] = None,
+        *args,
+        sample_shape: tuple = (),
+        **kwargs,
+    ) -> jax.Array:
+        """Convenience methods for predicting actions for the final timestep in the window."""
+        if embodiment_action_dim is None:
+            logging.warning(
+                "embodiment_action_dim is highly recommended for diffusion action head"
+                " if any action dimensions were masked during training"
+            )
+        batch_size, window_size = transformer_outputs[self.readout_key].tokens.shape[:2]
+        module, variables = self.unbind()
+
+        action_mask = jnp.ones(
+            (
+                *sample_shape,
+                batch_size,
+                window_size,
+                self.action_horizon,
+                self.action_dim,
+            ),
+            dtype=bool,
+        )
+        if embodiment_action_dim is not None:
+            action_mask = action_mask.at[..., embodiment_action_dim:].set(False)
+        flat_action_mask = rearrange(action_mask, "... p a -> ... (p a)")
+
+        def scan_fn(carry, time):
+            current_x, rng = carry
+            input_time = jnp.broadcast_to(time, (*current_x.shape[:-1], 1))
+
+            eps_pred = module.apply(
+                variables, transformer_outputs, input_time, current_x, train=train
+            )
+
+            alpha_1 = 1 / jnp.sqrt(self.alphas[time])
+            alpha_2 = (1 - self.alphas[time]) / (jnp.sqrt(1 - self.alpha_hats[time]))
+            current_x = alpha_1 * (current_x - alpha_2 * eps_pred)
+
+            rng, key = jax.random.split(rng)
+            z = jax.random.normal(key, shape=current_x.shape)
+            current_x = current_x + (time > 0) * (jnp.sqrt(self.betas[time]) * z)
+
+            current_x = jnp.clip(current_x, -self.max_action, self.max_action)
+
+            # set non-eval actions to the noise that would have been seen during training
+            current_x = jnp.where(
+                flat_action_mask, current_x, jnp.sqrt(1 - self.alpha_hats[time]) * z
+            )
+
+            return (current_x, rng), ()
+
+        rng, key = jax.random.split(rng)
+        noise = jax.random.normal(
+            key,
+            (
+                *sample_shape,
+                batch_size,
+                window_size,
+                self.action_horizon * self.action_dim,
+            ),
+        )
+
+        (actions_flat, _), () = jax.lax.scan(
+            scan_fn,
+            (noise, rng),
+            jnp.arange(self.diffusion_steps - 1, -1, -1),
+        )
+
+        actions = rearrange(
+            actions_flat,
+            "... (h a) -> ... h a",
+            h=self.action_horizon,
+            a=self.action_dim,
+        )
+        # only get the last timestep in the window
+        return actions[..., -1, :, :]
