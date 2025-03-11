@@ -15,7 +15,7 @@ import tqdm
 import wandb
 
 from octo.data.dataset import make_single_dataset
-from octo.model.components.action_heads import L1ActionHead
+from octo.model.components.action_heads import L1ActionHead, DiscreteDiffusionActionHead
 from octo.model.components.tokenizers import LowdimObsTokenizer
 from octo.model.octo_model import OctoModel
 from octo.utils.jax_utils import initialize_compilation_cache
@@ -41,6 +41,8 @@ import numpy as np
 from transformers import AutoProcessor
 from torch.utils.data._utils.collate import default_collate
 
+from utils import get_dataset_statistics
+
 MASK_TOKEN = 2048
 PAD_TOKEN = 2049
 
@@ -51,7 +53,7 @@ flags.DEFINE_string(
 )
 flags.DEFINE_string("data_dir", None, "Path to finetuning dataset, in RLDS format.")
 flags.DEFINE_string("save_dir", None, "Directory for saving finetuning checkpoints.")
-flags.DEFINE_integer("batch_size", 32, "Batch size for finetuning.")
+flags.DEFINE_integer("batch_size", 5, "Batch size for finetuning.")
 
 flags.DEFINE_bool(
     "freeze_transformer",
@@ -79,12 +81,6 @@ def main(_):
 
     ds_meta = LeRobotDatasetMetadata(repo_id, root=dataset_root)
 
-    # print(f"Total number of episodes: {ds_meta.total_episodes}")
-    # print(f"Average number of frames per episode: {ds_meta.total_frames / ds_meta.total_episodes:.3f}")
-    # print(f"Frames per second used during data collection: {ds_meta.fps}")
-    # print(f"Robot type: {ds_meta.robot_type}")
-    # print(f"keys to access images from cameras: {ds_meta.camera_keys=}\n")
-
     # Resize image to 256 x 256 for faster inference
     image_transforms = Resize((256, 256))
 
@@ -98,21 +94,16 @@ def main(_):
     le_dataset = LeRobotDataset(repo_id, root=dataset_root, delta_timestamps=delta_timestamps, image_transforms=image_transforms)
     print(f"Number of episodes selected: {le_dataset.num_episodes}")
     print(f"Number of frames selected: {le_dataset.num_frames}")
+    le_dataset_stats = get_dataset_statistics(le_dataset)
 
-    # episode_index = 1
-    # from_idx = le_dataset.episode_data_index["from"][episode_index].item()
-    # to_idx = le_dataset.episode_data_index["to"][episode_index].item()
-    # print(from_idx, to_idx)
-
-    # print(f"{le_dataset[0]['action'].shape=}")
-    
     camera_key = le_dataset.meta.camera_keys[0]
-    # print(f"\n{le_dataset[0][camera_key].shape=}")
 
-    # print(le_dataset[0])
+    # load pre-trained model
+    logging.info("Loading pre-trained model...")
+    pretrained_model = OctoModel.load_pretrained(FLAGS.pretrained_path)
 
+    text_processor = pretrained_model.text_processor
     tokenizer = AutoProcessor.from_pretrained("physical-intelligence/fast", trust_remote_code=True)
-    # tokens = tokenizer(ex_le_batch["action"].numpy())
 
     def collate_lerobot(orig_batch):
         new_batch = {}
@@ -134,6 +125,8 @@ def main(_):
 
         tokenized_action_batch = []
         tokenized_action_pad_batch = []
+
+        # tokenize actions in batch and match length to FLAGS.token_horizon, adding PAD_TOKEN if needed
         for batch_num_i in range(FLAGS.batch_size):
             valid_actions = action_org[batch_num_i][~action_pad_org[batch_num_i]]
             tokens = tokenizer(valid_actions)[0]
@@ -143,15 +136,10 @@ def main(_):
             else:
                 tokens = tokens[:FLAGS.token_horizon]
                 pad = [True] * len(tokens)
-            print(tokens)
-
             tokenized_action_batch.append(tokens)
             tokenized_action_pad_batch.append(pad)
         tokenized_action_batch = np.array(tokenized_action_batch) # (32,30) -> (batch_size, token_horizon)
         tokenized_action_pad_batch = np.array(tokenized_action_pad_batch) # (32, 30) -> (batch_size, token_horizon)
-
-        # print(tokenized_action_pad_batch.shape)
-        # print(tokenized_action_batch.shape)
 
         new_batch["action"] = tokenized_action_batch
         new_batch["action_pad_mask"] = tokenized_action_pad_batch
@@ -169,15 +157,30 @@ def main(_):
         # observation.timestep : (32, 1) numpy array
         # observation.pad_mask_dict : numpy array
         # observation.timestep_pad_mask : (32, 1) numpy array
-        # task_complete : (32, 1, 50) numpy array
+        # observation.task_complete : (32, 1, 50) numpy array
 
         new_batch["observation"] = {}
         new_batch["observation"]["image_primary"] = rearrange(orig_batch["observation.images.top"], "b n c h w -> b n h w c").numpy()
         new_batch["observation"]["proprio"] = orig_batch["observation.state"].numpy()
 
-
+        new_batch["observation"]["task_complete"] = tokenized_action_pad_batch # (32, 30)
 
         new_batch["task"] = {}
+        new_batch["task"]["language_instruction"] = text_processor.encode(
+            orig_batch["task"]
+        )
+        new_batch["task"]["pad_mask_dict"] = {}
+        new_batch["task"]["pad_mask_dict"]["language_instruction"] = np.array([[True] * FLAGS.batch_size])
+
+        new_batch["timestamp"] = (orig_batch["timestamp"] * 50).to(torch.int32).view(-1, 1).numpy()
+        # new_batch["timestamp"] = torch.IntTensor(orig_batch["timestamp"] * 50).numpy()
+
+        new_batch["observation"]["timestep_pad_mask"] = np.array([[True] * FLAGS.batch_size])
+
+        new_batch["observation"]["pad_mask_dict"] = {}
+        new_batch["observation"]["pad_mask_dict"]["image_primary"] = np.array([[True] for _ in range(FLAGS.batch_size)])
+        new_batch["observation"]["pad_mask_dict"]["proprio"] = np.array([[True] for _ in range(FLAGS.batch_size)])
+        new_batch["observation"]["pad_mask_dict"]["timestep"] = np.array([[True] for _ in range(FLAGS.batch_size)])
 
         return new_batch
 
@@ -188,33 +191,28 @@ def main(_):
         collate_fn=collate_lerobot
     ))
 
-
-    # load pre-trained model
-    logging.info("Loading pre-trained model...")
-    pretrained_model = OctoModel.load_pretrained(FLAGS.pretrained_path)
-
     # make finetuning dataset
     # apply Gaussian normalization, load chunks of 50 actions since we'll train with action chunking
     # delete goal images in the data loader since we will train a language-conditioned-only policy
     # TODO: directly load this from raw data to make it less opaque?
-    logging.info("Loading finetuning dataset...")
-    dataset = make_single_dataset(
-        dataset_kwargs=dict(
-            name="aloha_sim_cube_scripted_dataset",
-            data_dir=FLAGS.data_dir,
-            image_obs_keys={"primary": "top"},
-            proprio_obs_key="state",
-            language_key="language_instruction",
-        ),
-        traj_transform_kwargs=dict(
-            window_size=1,
-            action_horizon=50,
-        ),
-        frame_transform_kwargs=dict(
-            resize_size={"primary": (256, 256)},
-        ),
-        train=True,
-    )
+    # logging.info("Loading finetuning dataset...")
+    # dataset = make_single_dataset(
+    #     dataset_kwargs=dict(
+    #         name="aloha_sim_cube_scripted_dataset",
+    #         data_dir=FLAGS.data_dir,
+    #         image_obs_keys={"primary": "top"},
+    #         proprio_obs_key="state",
+    #         language_key="language_instruction",
+    #     ),
+    #     traj_transform_kwargs=dict(
+    #         window_size=1,
+    #         action_horizon=50,
+    #     ),
+    #     frame_transform_kwargs=dict(
+    #         resize_size={"primary": (256, 256)},
+    #     ),
+    #     train=True,
+    # )
     # train_data_iter = (
     #     dataset.repeat()
     #     .unbatch()
@@ -223,57 +221,35 @@ def main(_):
     #     .iterator()
     # )
 
-    train_data_iter = (
-        dataset.repeat()
-        .unbatch()
-        .batch(FLAGS.batch_size)
-        .iterator()
-    )
+    # train_data_iter = (
+    #     dataset.repeat()
+    #     .unbatch()
+    #     .batch(FLAGS.batch_size)
+    #     .iterator()
+    # )
 
-    # run text tokenizer over batch (this needs to happen before training / sharding) + delete unused keys
-    text_processor = pretrained_model.text_processor
+    # def process_batch(batch):
+    #     batch = process_text(batch, text_processor)
+    #     del batch["dataset_name"]
+    #     return batch
 
-    def process_batch(batch):
-        batch = process_text(batch, text_processor)
-        del batch["dataset_name"]
-        return batch
-
-    train_data_iter = map(process_batch, train_data_iter)
-    example_batch = next(train_data_iter)
-
+    # train_data_iter = map(process_batch, train_data_iter)
+    # example_batch = next(train_data_iter)
     ex_le_batch = next(le_dataloader)
-
-    # image_primary : array
-    # proprio : array
-    # timestep
-
-    # print(example_batch["action"].shape)
-    # print(example_batch["action_pad_mask"].shape)
-
-    print(ex_le_batch["action"].shape)
-    print(ex_le_batch["action_is_pad"])
-    exit(0)
-    
-    
-    print(tokenizer.vocab_size)
-
-    print(tokens)
-
-    for rt in tokens:
-        print(len(rt))
 
     # print(example_batch["observation"]["image_primary"].shape)
     # print(example_batch["observation"]["proprio"].shape)
-    print(example_batch["observation"]["timestep"])
+    # print(example_batch["observation"]["timestep"])
     # print(example_batch["observation"]["pad_mask_dict"])
-    print(example_batch["observation"]["timestep_pad_mask"])
-    print(example_batch["observation"]["task_completed"].shape, "\n")
+    # print(example_batch["observation"]["timestep_pad_mask"])
+    # print(example_batch["observation"]["task_completed"][0], "\n")
+    # print(example_batch["task"])
 
     # print(ex_le_batch["observation.images.top"].shape)
     # print(ex_le_batch["observation.state"].shape)
-    print(ex_le_batch["next.done"].shape)
-    print(ex_le_batch["timestamp"])
-
+    # print(ex_le_batch["next.done"])
+    # print(ex_le_batch["timestamp"])
+    # print(ex_le_batch["task"])
 
     # for key in ex_le_batch.keys():
     #     print(key, type(ex_le_batch[key]))
@@ -284,38 +260,36 @@ def main(_):
     # for key in example_batch["task"]:
     #     print(key, type(example_batch["task"][key]))
 
-    exit(0)
-
     # load pre-training config and modify --> remove wrist cam, add proprio input, change action head
     # following Zhao et al. we use "action chunks" of length 50 and L1 loss for ALOHA
     config = pretrained_model.config
-    # del config["model"]["observation_tokenizers"]["wrist"]
-    # ###
-    # config["model"]["observation_tokenizers"]["proprio"] = ModuleSpec.create(
-    #     LowdimObsTokenizer,
-    #     n_bins=256,
-    #     bin_type="normal",
-    #     low=-2.0,
-    #     high=2.0,
-    #     obs_keys=["proprio"],
-    # )
-    # # Fully override the old action head with a new one (for smaller changes, you can use update_config)
-    # config["model"]["heads"]["action"] = ModuleSpec.create(
-    #     L1ActionHead,
-    #     action_horizon=50,
-    #     action_dim=14,
-    #     readout_key="readout_action",
-    # )
+    del config["model"]["observation_tokenizers"]["wrist"]
+    ###
+    config["model"]["observation_tokenizers"]["proprio"] = ModuleSpec.create(
+        LowdimObsTokenizer,
+        n_bins=256,
+        bin_type="normal",
+        low=-2.0,
+        high=2.0,
+        obs_keys=["proprio"],
+    )
+    # Fully override the old action head with a new one (for smaller changes, you can use update_config)
+    config["model"]["heads"]["action"] = ModuleSpec.create(
+        L1ActionHead,
+        action_horizon=50,
+        action_dim=14,
+        readout_key="readout_action",
+    )
 
     # initialize weights for modified Octo model, then merge in all applicable pre-trained weights
     # new position encodings for proprio inputs & weights for new action head will remain "from scratch"
     logging.info("Updating model for new observation & action space...")
     model = OctoModel.from_config(
         config,
-        example_batch,
+        ex_le_batch,
         text_processor,
         verbose=True,
-        dataset_statistics=dataset.dataset_statistics,
+        dataset_statistics=le_dataset_stats,
     )
     merged_params = merge_params(model.params, pretrained_model.params)
     # can perform any additional parameter surgery here...
@@ -369,7 +343,7 @@ def main(_):
     # run finetuning loop
     logging.info("Starting finetuning...")
     for i in tqdm.tqdm(range(5000), total=5000, dynamic_ncols=True):
-        batch = next(train_data_iter)
+        batch = next(le_dataloader)
         train_state, update_info = train_step(train_state, batch)
         if (i + 1) % 100 == 0:
             update_info = jax.device_get(update_info)
