@@ -33,6 +33,12 @@ def generate_proper_pad_mask(
 
     pad_mask = jnp.stack([pad_mask_dict[key] for key in keys], axis=-1)
     pad_mask = jnp.any(pad_mask, axis=-1)
+
+
+    # print(pad_mask[..., None])
+    # print(tokens.shape[:-1])
+    # exit(0)
+
     pad_mask = jnp.broadcast_to(pad_mask[..., None], tokens.shape[:-1])
     return pad_mask
 

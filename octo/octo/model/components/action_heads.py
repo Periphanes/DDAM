@@ -17,6 +17,7 @@ from octo.model.components.transformer import MAPHead
 from octo.model.components.unet import ConditionalUnet1D, unet_squaredcos_cap_v2
 from octo.utils.typing import PRNGKey
 
+import utils.noise_schedule
 
 class ActionHead(ABC):
     """Action prediction modules that take in the transformer token outputs and predict actions.
@@ -887,13 +888,15 @@ class DiscreteDiffusionActionHead(nn.Module):
     vocab_size += 1
     # Pad Index = 2049
 
+    noise = utils.noise_schedule.get_noise("loglinear", 1e-4, 20)
+
     def setup(self):
         if self.use_map:
             self.map_head = MAPHead()
 
         # create the diffusion model (score network)
         self.diffusion_model = create_diffusion_model(
-            self.action_dim * self.action_horizon,
+            self.vocab_size,
             time_dim=self.time_dim,
             num_blocks=self.num_blocks,
             dropout_rate=self.dropout_rate,
@@ -938,6 +941,16 @@ class DiscreteDiffusionActionHead(nn.Module):
             )
         pred_eps = self.diffusion_model(embeddings, noisy_actions, time, train=train)
         return pred_eps
+    
+    def _q_xt(self, x, move_chance):
+        """Masks given input x with mask token with move_chance
+        """
+    
+        rng = self.make_rng("masking")
+        random_vals = jax.random.uniform(rng, shape=x.shape)
+        move_indices = random_vals < move_chance
+
+        return jnp.where(move_indices, self.mask_index, x)
 
     def loss(
         self,
@@ -975,6 +988,11 @@ class DiscreteDiffusionActionHead(nn.Module):
             0,
             self.diffusion_steps,
         )
+
+        print(time)
+
+        exit(0)
+
         noise = jax.random.normal(
             noise_key, (self.n_diffusion_samples,) + actions_flat.shape
         )

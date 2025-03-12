@@ -41,7 +41,7 @@ import numpy as np
 from transformers import AutoProcessor
 from torch.utils.data._utils.collate import default_collate
 
-from utils import get_dataset_statistics
+from utils.utils import get_dataset_statistics
 
 MASK_TOKEN = 2048
 PAD_TOKEN = 2049
@@ -163,24 +163,32 @@ def main(_):
         new_batch["observation"]["image_primary"] = rearrange(orig_batch["observation.images.top"], "b n c h w -> b n h w c").numpy()
         new_batch["observation"]["proprio"] = orig_batch["observation.state"].numpy()
 
-        new_batch["observation"]["task_complete"] = tokenized_action_pad_batch # (32, 30)
+        new_batch["observation"]["task_complete"] = tokenized_action_pad_batch[:, None, :] # (32, 1, 30)
 
         new_batch["task"] = {}
         new_batch["task"]["language_instruction"] = text_processor.encode(
             orig_batch["task"]
         )
         new_batch["task"]["pad_mask_dict"] = {}
-        new_batch["task"]["pad_mask_dict"]["language_instruction"] = np.array([[True] * FLAGS.batch_size])
+        new_batch["task"]["pad_mask_dict"]["language_instruction"] = np.array([True] * FLAGS.batch_size)
 
         new_batch["timestamp"] = (orig_batch["timestamp"] * 50).to(torch.int32).view(-1, 1).numpy()
         # new_batch["timestamp"] = torch.IntTensor(orig_batch["timestamp"] * 50).numpy()
 
-        new_batch["observation"]["timestep_pad_mask"] = np.array([[True] * FLAGS.batch_size])
+        new_batch["observation"]["timestep_pad_mask"] = np.array([[True] for _ in range(FLAGS.batch_size)])
 
         new_batch["observation"]["pad_mask_dict"] = {}
         new_batch["observation"]["pad_mask_dict"]["image_primary"] = np.array([[True] for _ in range(FLAGS.batch_size)])
         new_batch["observation"]["pad_mask_dict"]["proprio"] = np.array([[True] for _ in range(FLAGS.batch_size)])
         new_batch["observation"]["pad_mask_dict"]["timestep"] = np.array([[True] for _ in range(FLAGS.batch_size)])
+
+
+        # print(new_batch["observation"]["image_primary"].shape)
+        # print(new_batch["observation"]["proprio"].shape)
+        # print(new_batch["observation"]["task_complete"].shape)
+        # print(new_batch["observation"]["timestep_pad_mask"].shape)
+
+        # exit(0)
 
         return new_batch
 
@@ -196,30 +204,30 @@ def main(_):
     # delete goal images in the data loader since we will train a language-conditioned-only policy
     # TODO: directly load this from raw data to make it less opaque?
     # logging.info("Loading finetuning dataset...")
-    # dataset = make_single_dataset(
-    #     dataset_kwargs=dict(
-    #         name="aloha_sim_cube_scripted_dataset",
-    #         data_dir=FLAGS.data_dir,
-    #         image_obs_keys={"primary": "top"},
-    #         proprio_obs_key="state",
-    #         language_key="language_instruction",
-    #     ),
-    #     traj_transform_kwargs=dict(
-    #         window_size=1,
-    #         action_horizon=50,
-    #     ),
-    #     frame_transform_kwargs=dict(
-    #         resize_size={"primary": (256, 256)},
-    #     ),
-    #     train=True,
-    # )
-    # train_data_iter = (
-    #     dataset.repeat()
-    #     .unbatch()
-    #     .shuffle(10000)  # can reduce this if RAM consumption too high
-    #     .batch(FLAGS.batch_size)
-    #     .iterator()
-    # )
+    dataset = make_single_dataset(
+        dataset_kwargs=dict(
+            name="aloha_sim_cube_scripted_dataset",
+            data_dir=FLAGS.data_dir,
+            image_obs_keys={"primary": "top"},
+            proprio_obs_key="state",
+            language_key="language_instruction",
+        ),
+        traj_transform_kwargs=dict(
+            window_size=1,
+            action_horizon=50,
+        ),
+        frame_transform_kwargs=dict(
+            resize_size={"primary": (256, 256)},
+        ),
+        train=True,
+    )
+    train_data_iter = (
+        dataset.repeat()
+        .unbatch()
+        .shuffle(10000)  # can reduce this if RAM consumption too high
+        .batch(FLAGS.batch_size)
+        .iterator()
+    )
 
     # train_data_iter = (
     #     dataset.repeat()
@@ -228,13 +236,13 @@ def main(_):
     #     .iterator()
     # )
 
-    # def process_batch(batch):
-    #     batch = process_text(batch, text_processor)
-    #     del batch["dataset_name"]
-    #     return batch
+    def process_batch(batch):
+        batch = process_text(batch, text_processor)
+        del batch["dataset_name"]
+        return batch
 
-    # train_data_iter = map(process_batch, train_data_iter)
-    # example_batch = next(train_data_iter)
+    train_data_iter = map(process_batch, train_data_iter)
+    example_batch = next(train_data_iter)
     ex_le_batch = next(le_dataloader)
 
     # print(example_batch["observation"]["image_primary"].shape)
@@ -275,7 +283,7 @@ def main(_):
     )
     # Fully override the old action head with a new one (for smaller changes, you can use update_config)
     config["model"]["heads"]["action"] = ModuleSpec.create(
-        L1ActionHead,
+        DiscreteDiffusionActionHead,
         action_horizon=50,
         action_dim=14,
         readout_key="readout_action",
@@ -291,6 +299,13 @@ def main(_):
         verbose=True,
         dataset_statistics=le_dataset_stats,
     )
+    # model = OctoModel.from_config(
+    #     config,
+    #     example_batch,
+    #     text_processor,
+    #     verbose=True,
+    #     dataset_statistics=le_dataset_stats,
+    # )
     merged_params = merge_params(model.params, pretrained_model.params)
     # can perform any additional parameter surgery here...
     # ...
@@ -344,6 +359,7 @@ def main(_):
     logging.info("Starting finetuning...")
     for i in tqdm.tqdm(range(5000), total=5000, dynamic_ncols=True):
         batch = next(le_dataloader)
+        # batch = next(train_data_iter)
         train_state, update_info = train_step(train_state, batch)
         if (i + 1) % 100 == 0:
             update_info = jax.device_get(update_info)
