@@ -61,6 +61,8 @@ flags.DEFINE_bool(
     "Whether pre-trained transformer weights should be frozen.",
 )
 
+flags.DEFINE_bool("discrete_actions", True, "Whether to use discrete actions or not")
+
 flags.DEFINE_integer("action_horizon", 75, "action horizon sampled before tokenization")
 flags.DEFINE_integer("token_horizon", 30, "number of tokens used as action chunk horizon")
 
@@ -68,6 +70,12 @@ def main(_):
     assert (
         FLAGS.batch_size % jax.device_count() == 0
     ), "Batch size must be divisible by device count."
+
+
+    if FLAGS.discrete_actions:
+        ACTION_DIM = 1
+    else:
+        ACTION_DIM = 14
 
     initialize_compilation_cache()
     # prevent tensorflow from using GPU memory since it's only used for data loading
@@ -284,8 +292,8 @@ def main(_):
     # Fully override the old action head with a new one (for smaller changes, you can use update_config)
     config["model"]["heads"]["action"] = ModuleSpec.create(
         DiscreteDiffusionActionHead,
-        action_horizon=50,
-        action_dim=14,
+        action_horizon=30,
+        action_dim=ACTION_DIM,
         readout_key="readout_action",
     )
 

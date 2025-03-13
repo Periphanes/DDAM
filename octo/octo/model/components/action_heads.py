@@ -10,8 +10,10 @@ from jax import Array
 import jax.numpy as jnp
 from jax.typing import ArrayLike
 
+import numpy as np
+
 from octo.model.components.base import TokenGroup
-from octo.model.components.diffusion import cosine_beta_schedule, create_diffusion_model
+from octo.model.components.diffusion import cosine_beta_schedule, create_diffusion_model, create_discrete_diffusion_model
 from octo.model.components.tokenizers import BinTokenizer
 from octo.model.components.transformer import MAPHead
 from octo.model.components.unet import ConditionalUnet1D, unet_squaredcos_cap_v2
@@ -889,13 +891,18 @@ class DiscreteDiffusionActionHead(nn.Module):
     # Pad Index = 2049
 
     noise = utils.noise_schedule.get_noise("loglinear", 1e-4, 20)
+    noise_eps = 1e-3
+    noise_sigma_min = 1e-4
+    noise_sigma_max = 20
+
+    action_token_horizon = 30
 
     def setup(self):
         if self.use_map:
             self.map_head = MAPHead()
 
         # create the diffusion model (score network)
-        self.diffusion_model = create_diffusion_model(
+        self.diffusion_model = create_discrete_diffusion_model(
             self.vocab_size,
             time_dim=self.time_dim,
             num_blocks=self.num_blocks,
@@ -939,15 +946,26 @@ class DiscreteDiffusionActionHead(nn.Module):
                 (*embeddings.shape[:2], self.action_dim * self.action_horizon),
                 dtype=jnp.float32,
             )
+
+        noisy_actions = jnp.squeeze(noisy_actions, axis=0)
+        time = jnp.squeeze(time, axis=0)
+
+        # print("Embeddings :", embeddings)
+        # print("Noisy Actions :", noisy_actions)
+        # print("Time :", time)
+
+        # noisy_actions = rearrange(noisy_actions, "w b d -> b w d")
+        # time = rearrange(noisy_actions, "w b d -> b w d")
+
         pred_eps = self.diffusion_model(embeddings, noisy_actions, time, train=train)
         return pred_eps
     
-    def _q_xt(self, x, move_chance):
+    def _q_xt(self, x, move_chance, key):
         """Masks given input x with mask token with move_chance
         """
     
-        rng = self.make_rng("masking")
-        random_vals = jax.random.uniform(rng, shape=x.shape)
+        # rng = self.make_rng("masking")
+        random_vals = jax.random.uniform(key, shape=x.shape)
         move_indices = random_vals < move_chance
 
         return jnp.where(move_indices, self.mask_index, x)
@@ -976,34 +994,54 @@ class DiscreteDiffusionActionHead(nn.Module):
         batch_size, window_size = timestep_pad_mask.shape
 
         # fold action_dim and action_horizon into one dimension
-        actions_flat = rearrange(actions, "b w h a -> b w (h a)")
-        actions_flat = jnp.clip(actions_flat, -self.max_action, self.max_action)
+        # actions_flat = rearrange(actions, "b w h a -> b w (h a)")
+        # actions_flat = jnp.clip(actions_flat, -self.max_action, self.max_action)
+
+        actions_flat = actions
 
         # piggy-back on the dropout rng chain for diffusion rng
         rng = self.make_rng("dropout")
         time_key, noise_key = jax.random.split(rng)
         time = jax.random.randint(
             time_key,
-            (self.n_diffusion_samples, batch_size, window_size, 1),
+            (self.n_diffusion_samples, batch_size, 1),
             0,
             self.diffusion_steps,
         )
 
-        print(time)
+        # Time shape (1, batch_size, 1)
+        # Action shape (batch_size, action_token_horizon)
 
-        exit(0)
+        # Log Linear Noise without Importance Sampling
+        normalized_time = time / self.diffusion_steps
+        sigma = (1 - self.noise_eps) / (1 - (1 - self.noise_eps) * normalized_time)
+        dsigma = -jnp.log1p(-(1 - self.noise_eps) * normalized_time)
 
-        noise = jax.random.normal(
-            noise_key, (self.n_diffusion_samples,) + actions_flat.shape
-        )
+        unet_conditioning = sigma
+        move_chance = 1 - jnp.exp(-sigma)
 
-        scale = jnp.sqrt(self.alpha_hats[time])
-        std = jnp.sqrt(1 - self.alpha_hats[time])
-        noisy_actions = scale * actions_flat[None] + std * noise
+        xt = self._q_xt(actions_flat, move_chance, noise_key) # (1, batch_size, action_token_horizon)
+
+        jax.debug.print("actions_flat = {}", actions_flat)
+        jax.debug.print("xt = {}", xt)
+
+        # noise = jax.random.normal(
+        #     noise_key, (self.n_diffusion_samples,) + actions_flat.shape
+        # )
+
+        # scale = jnp.sqrt(self.alpha_hats[time])
+        # std = jnp.sqrt(1 - self.alpha_hats[time])
+        # noisy_actions = scale * actions_flat[None] + std * noise
+
+        # noisy_actions <=> xt
 
         pred_eps = self(
-            transformer_outputs, train=train, time=time, noisy_actions=noisy_actions
+            transformer_outputs, train=train, time=time, noisy_actions=xt
         )
+
+        print(pred_eps)
+
+        exit()
 
         # combine the timestep pad mask with the action pad mask
         mask = timestep_pad_mask[:, :, None, None] & action_pad_mask
